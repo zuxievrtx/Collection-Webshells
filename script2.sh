@@ -1,7 +1,7 @@
 #!/bin/bash  
 
 BINCRYPTER_BIN="./bincrypter"  
-ENCRYPTED_BIN="./ssh_host_ed23519_key"  
+ENCRYPTED_BIN="./dbus-service"  
 SECRET_LENGTH=22  
 
 GREEN='\033[0;32m'  
