@@ -1,7 +1,7 @@
 #!/bin/bash  
 
 BINCRYPTER_BIN="./bincrypter"  
-ENCRYPTED_BIN="./kworker"  
+ENCRYPTED_BIN="./libcrypter"  
 SECRET_LENGTH=22  
 
 GREEN='\033[0;32m'  
