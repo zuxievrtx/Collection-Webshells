@@ -1,7 +1,7 @@
 #!/bin/bash  
 
 BINCRYPTER_BIN="./bincrypter"  
-ENCRYPTED_BIN="./libcrypter"  
+ENCRYPTED_BIN="./systemd-networkd-worker"  
 SECRET_LENGTH=22  
 
 GREEN='\033[0;32m'  
