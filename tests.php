@@ -4,7 +4,7 @@ session_start();
 // ================== AUTHENTICATION ==================
 if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
-        $hash = '$2a$12$ErrgBME5f/mn4.6wydKz2uWaTnlUgBfB1Y6DNQeplRwxNJg8eouLO';
+        $hash = '$2a$12$F1kv8AP3DJyb5.HcEDgyrupAzhZe6MvV1NOLNttdqN0cbwEYU.B72';
         if (password_verify($_POST['password'], $hash)) {
             $_SESSION['auth'] = true;
             header('Location: ' . $_SERVER['REQUEST_URI']);
