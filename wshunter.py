@@ -221,6 +221,25 @@ HTACCESS_RULES = [
        r"RewriteCond\s+%\{HTTP_(?:USER_AGENT|REFERER)\}[^\n]*(?:google|bing|yahoo)"),
     _r("HT-LOCK", 6, "Pola 'lock' defacer: blokir semua PHP kecuali file tertentu",
        r"<FilesMatch\s+[\"'][^\"'\n]*php[^\"'\n]*[\"']>\s*Order\s+allow,\s*deny\s*Deny\s+from\s+all"),
+    # --- Pola "cloaking" backdoor (allowlist shell + redirect sisanya) ---
+    _r("HT-PHP-ALLOWLIST", 7,
+       "Allowlist beberapa berkas .php di-passthrough (khas menyembunyikan backdoor)",
+       r"RewriteRule\s+\S*\([^)\n]*\|[^)\n]*\|[^)\n]*\)\\?\.php\d?\$?\s+-\s+\["),
+    _r("HT-PHP-CLOAK", 5,
+       "Menyaring akses langsung ke .php via THE_REQUEST (menyembunyikan shell)",
+       r"%\{THE_REQUEST\}[^\n]*\\?\.php\b"),
+    _r("HT-EXT-REDIRECT", 4,
+       "Redirect ke domain eksternal literal via RewriteRule (cloaking/deface)",
+       r"RewriteRule\s+\S+\s+https?://(?!%\{)[^\s/]+\.[A-Za-z]{2,}\S*\s+\[[^\]]*\bR\b"),
+    _r("HT-EXT-REDIRECT-SUSP", 5,
+       "Redirect ke hosting gratis / alamat IP (indikator kuat situs diretas)",
+       r"RewriteRule\s+\S+\s+https?://(?:[^\s/]*\.)?"
+       r"(?:netlify\.app|vercel\.app|pages\.dev|web\.app|firebaseapp\.com|blogspot\.|"
+       r"herokuapp\.com|glitch\.me|repl\.co|workers\.dev|000webhost\.com|"
+       r"\d{1,3}(?:\.\d{1,3}){3})\S*\s+\[[^\]]*\bR\b"),
+    _r("HT-SELF-DENY", 1,
+       "Menyembunyikan .htaccess dari akses (Require all denied pada .htaccess)",
+       r"<Files\s+\"?\.htaccess\"?>\s*(?:Require\s+all\s+denied|Deny\s+from\s+all|Order\s+)"),
 ]
 
 USERINI_RULES = [
@@ -263,6 +282,79 @@ def max_string_entropy(text, limit=300):
             continue
         best = max(best, shannon_entropy(s[:4096]))
     return best
+
+
+# --- Ekstraksi daftar allowlist (nama backdoor) dari .htaccess penyerang ------
+# Berkas WordPress asli yang wajar di-passthrough attacker -> BUKAN IOC.
+WP_CORE_BASENAMES = {
+    "index", "wp-login", "wp-blog-header", "wp-config", "wp-config-sample",
+    "wp-load", "wp-settings", "wp-cron", "wp-mail", "xmlrpc", "admin-ajax",
+    "admin-post", "wp-comments-post", "wp-trackback", "wp-activate",
+    "wp-signup", "wp-links-opml", "load-scripts", "load-styles",
+}
+HTA_PASSTHRU_RE = re.compile(r"RewriteRule\s+(\S+)\s+-\s+\[", re.IGNORECASE)
+HTA_ALT_RE = re.compile(r"\(([^)]*)\)")
+HTA_NAME_RE = re.compile(r"([A-Za-z0-9_.-]{2,60})\\?\.php\d?(?:[$\\]|\b)", re.IGNORECASE)
+
+
+def classify_ioc_name(name):
+    """Kembalikan 'random' (hampir pasti backdoor), 'generic', atau None (abaikan)."""
+    n = name.strip().lower().lstrip(".")
+    if not n or n in WP_CORE_BASENAMES or n.startswith("wp-content"):
+        return None
+    if (len(name) >= 8 and any(c.isupper() for c in name)
+            and any(c.islower() for c in name) and any(c.isdigit() for c in name)):
+        return "random"
+    if len(name) >= 7 and shannon_entropy(name) >= 3.4:
+        return "random"
+    return "generic"
+
+
+def extract_htaccess_allowlist(text):
+    """Ambil nama .php dari RewriteRule passthrough (target '-'); pisah acak/umum."""
+    random_names, generic_names = set(), set()
+    for m in HTA_PASSTHRU_RE.finditer(text):
+        pat = m.group(1)
+        if ".php" not in pat.lower():
+            continue
+        tokens = []
+        for alt in HTA_ALT_RE.findall(pat):
+            if "|" in alt:
+                tokens += alt.split("|")
+        tokens += HTA_NAME_RE.findall(pat)
+        for tok in tokens:
+            tok = tok.strip().strip("^$/").replace("\\", "")
+            if not re.match(r"^[A-Za-z0-9_.-]{2,60}$", tok or ""):
+                continue
+            cls = classify_ioc_name(tok)
+            if cls == "random":
+                random_names.add(tok.lower().lstrip("."))
+            elif cls == "generic":
+                generic_names.add(tok.lower().lstrip("."))
+    return random_names, generic_names
+
+
+# --- Template pemulihan .htaccess -------------------------------------------
+WP_ROOT_HTACCESS = (
+    "# BEGIN WordPress\n"
+    "<IfModule mod_rewrite.c>\n"
+    "RewriteEngine On\n"
+    "RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n"
+    "RewriteBase /\n"
+    "RewriteRule ^index\\.php$ - [L]\n"
+    "RewriteCond %{REQUEST_FILENAME} !-f\n"
+    "RewriteCond %{REQUEST_FILENAME} !-d\n"
+    "RewriteRule . /index.php [L]\n"
+    "</IfModule>\n"
+    "# END WordPress\n"
+)
+HARDEN_HTACCESS = (
+    "# Dipulihkan oleh wshunter - tolak eksekusi skrip di direktori ini\n"
+    "<FilesMatch \"\\.(php|php[0-9]|phtml|phar|pht|phps|cgi|pl|py|sh)$\">\n"
+    "    Require all denied\n"
+    "</FilesMatch>\n"
+    "Options -Indexes -ExecCGI\n"
+)
 
 
 def sanitize(s, limit=160):
@@ -393,6 +485,11 @@ class Scanner(object):
         self.now = time.time()
         self.stats = collections.Counter()
         self.errors = []
+        # IOC yang diekstrak dari .htaccess penyerang (nama berkas allowlist)
+        self.ioc_random = set()     # nama acak -> hampir pasti backdoor
+        self.ioc_generic = set()    # nama umum -> verifikasi via lokasi/konten
+        self.ioc_dirs = set()       # realpath direktori ber-.htaccess terkontaminasi
+        self.ioc_sources = {}       # nama -> (path_htaccess, kelas)
 
     # ---- traversal ----------------------------------------------------------
     def _err(self, path, exc):
@@ -428,6 +525,13 @@ class Scanner(object):
                     keep.append(d)
             dirnames[:] = keep
             self.stats["dirs_scanned"] += 1
+            # Proses .htaccess LEBIH DAHULU agar IOC (nama allowlist) dikenali
+            # sebelum berkas .php di direktori ini & sub-direktori dipindai.
+            if ".htaccess" in filenames:
+                try:
+                    self._ingest_htaccess(os.path.join(dirpath, ".htaccess"), dirpath)
+                except Exception as exc:
+                    self._err(os.path.join(dirpath, ".htaccess"), "ioc: %r" % exc)
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
                 rel = fn if rel_dir == "." else rel_dir + "/" + fn
@@ -445,6 +549,29 @@ class Scanner(object):
         if self.show_progress:
             sys.stderr.write("\r" + " " * 60 + "\r")
         return findings
+
+    # ---- ekstraksi IOC dari .htaccess -----------------------------------------
+    def _ingest_htaccess(self, path, dirpath):
+        try:
+            if stat.S_ISLNK(os.lstat(path).st_mode):
+                return
+        except OSError:
+            return
+        data = self._read(path)
+        if not data:
+            return
+        text = data.decode("latin-1", "replace")
+        score = sum(h["weight"] for h in apply_rules(text, HTACCESS_RULES))
+        if score < 6:                      # bukan pola terkontaminasi -> abaikan
+            return
+        self.ioc_dirs.add(os.path.realpath(dirpath))
+        rnd, gen = extract_htaccess_allowlist(text)
+        for n in rnd:
+            self.ioc_random.add(n)
+            self.ioc_sources.setdefault(n, (path, "random"))
+        for n in gen:
+            self.ioc_generic.add(n)
+            self.ioc_sources.setdefault(n, (path, "generic"))
 
     # ---- per berkas -----------------------------------------------------------
     def _time_ok(self, st):
@@ -532,7 +659,7 @@ class Scanner(object):
 
         # --- analisis per kategori ---
         if category == "php":
-            hits += self._php_checks(text, rel, lower, ext)
+            hits += self._php_checks(text, rel, lower, ext, path)
         elif category in ("script", "shellrc"):
             hits += apply_rules(text, SCRIPT_RULES)
         elif category == "config":
@@ -571,11 +698,26 @@ class Scanner(object):
             "mtime": iso(st.st_mtime), "ctime": iso(st.st_ctime),
             "quarantinable": category in ("php", "script"),
             "is_config": category == "config",
+            "is_htaccess": (lower == ".htaccess"),
             "action": "", "_ino": st.st_ino, "_mtime_raw": st.st_mtime,
         }
 
-    def _php_checks(self, text, rel, lower, ext):
+    def _php_checks(self, text, rel, lower, ext, path=""):
         hits = apply_rules(text, PHP_RULES) + apply_rules(text, SEO_RULES)
+        # --- cocokkan nama berkas dengan allowlist .htaccess penyerang ---
+        if self.ioc_random or self.ioc_generic:
+            stem = lower.split(".php")[0] if ".php" in lower else os.path.splitext(lower)[0]
+            stem = stem.lstrip(".")
+            if stem in self.ioc_random:
+                src = self.ioc_sources.get(stem, ("", ""))[0]
+                hits.append(hit("HTACCESS-IOC-RANDOM", 10,
+                                "Nama acak cocok dengan allowlist di .htaccess penyerang"
+                                + (" (%s)" % src if src else "")))
+            elif stem in self.ioc_generic:
+                same = path and os.path.realpath(os.path.dirname(path)) in self.ioc_dirs
+                hits.append(hit("HTACCESS-IOC-NAME", 5 if same else 2,
+                                "Nama '%s' tercantum di allowlist .htaccess penyerang%s"
+                                % (stem, " (folder yang sama)" if same else "")))
         if DOUBLE_EXT_EXEC_RE.search(lower):
             hits.append(hit("NAME-DOUBLE-EXT", 6, "Ekstensi ganda/samaran (mis. .php.jpg)"))
         elif DOUBLE_EXT_BAK_RE.search(lower):
@@ -822,6 +964,107 @@ class QuarantineManager(object):
 
 
 # =============================================================================
+# 6b. PEMULIHAN .htaccess KE DEFAULT
+# =============================================================================
+class HtaccessRestorer(object):
+    """Cadangkan .htaccess terkontaminasi ke karantina, lalu tulis default bersih."""
+    WP_MARKERS = ("wp-load.php", "wp-settings.php", "wp-config.php", "wp-blog-header.php")
+
+    def __init__(self, root, choice, dry_run):
+        self.root = root
+        self.choice = choice          # auto | wp-root | harden | minimal
+        self.dry_run = dry_run
+        self.qdir = os.path.join(root, ".quarantine_"
+                                 + datetime.date.today().strftime("%Y%m%d"))
+        self.actions = []
+
+    def _pick(self, path):
+        if self.choice != "auto":
+            return self.choice
+        d = os.path.dirname(path)
+        if any(os.path.isfile(os.path.join(d, m)) for m in self.WP_MARKERS):
+            return "wp-root"
+        # heuristik lokasi diuji pada path RELATIF root (hindari /tmp, /home, dll)
+        rel = os.path.relpath(d, self.root).lower().replace("\\", "/")
+        if re.search(r"(?:^|/)(?:uploads?|images?|img|media|assets|files|cache|tmp|temp|logs?)(?:/|$)",
+                     rel):
+            return "harden"
+        return "minimal"
+
+    def _content(self, choice):
+        if choice == "wp-root":
+            return WP_ROOT_HTACCESS
+        if choice == "harden":
+            return HARDEN_HTACCESS
+        return ("# Dipulihkan oleh wshunter pada %s\n"
+                "# Berkas .htaccess asli (mencurigakan) dipindahkan ke karantina "
+                "untuk analisis.\n" % iso(time.time()))
+
+    def plan(self, targets):
+        return [(f, self._pick(f["path"])) for f in targets]
+
+    def _rec(self, f, choice, status, backup="", note="", preview=""):
+        act = {"timestamp": iso(time.time()), "status": status, "path": f["path"],
+               "template": choice, "backup": backup, "note": note}
+        if preview:
+            act["would_write"] = preview
+        self.actions.append(act)
+        f["action"] = "RESTORE(%s) %s%s" % (choice, status, " - " + note if note else "")
+        return act
+
+    def execute(self, targets):
+        plan = self.plan(targets)
+        if not plan:
+            return self.actions
+        if self.dry_run:
+            for f, choice in plan:
+                self._rec(f, choice, "DRY-RUN",
+                          note="akan dipulihkan ke template '%s'" % choice,
+                          preview=self._content(choice))
+            return self.actions
+        try:
+            if os.path.isdir(self.qdir):
+                os.chmod(self.qdir, 0o700)
+            else:
+                os.makedirs(self.qdir, 0o700)
+        except OSError as exc:
+            for f, choice in plan:
+                self._rec(f, choice, "FAILED", note="karantina tak siap: %s" % exc)
+            return self.actions
+        for f, choice in plan:
+            self._restore_one(f, choice)
+        try:
+            os.chmod(self.qdir, 0o000)
+        except OSError:
+            pass
+        return self.actions
+
+    def _restore_one(self, f, choice):
+        path = f["path"]
+        slug = re.sub(r"[^A-Za-z0-9]", "_",
+                      os.path.relpath(os.path.dirname(path), self.root))[:60] or "root"
+        backup = os.path.join(self.qdir, "%s_%s.htaccess.quarantined"
+                              % ((f.get("sha256") or "nohash")[:12], slug))
+        n = 1
+        while os.path.exists(backup):
+            backup = "%s.%d" % (backup, n)
+            n += 1
+        try:                                   # 1) cadangkan berkas jahat (forensik)
+            shutil.copy2(path, backup)
+            os.chmod(backup, 0)
+        except (OSError, IOError) as exc:
+            return self._rec(f, choice, "FAILED", note="gagal mencadangkan: %s" % exc)
+        try:                                   # 2) timpa dengan template bersih
+            with open(path, "w") as fh:
+                fh.write(self._content(choice))
+            os.chmod(path, 0o644)
+        except (OSError, IOError) as exc:
+            return self._rec(f, choice, "FAILED", backup,
+                             note="cadangan tersimpan tetapi gagal menulis default: %s" % exc)
+        return self._rec(f, choice, "RESTORED", backup)
+
+
+# =============================================================================
 # 7. REPORTER (terminal + log teks + JSON)
 # =============================================================================
 class Reporter(object):
@@ -868,6 +1111,34 @@ class Reporter(object):
             if f.get("action"):
                 self.out("           aksi: " + f["action"])
 
+    def iocs(self, scanner):
+        if not (scanner.ioc_random or scanner.ioc_generic):
+            return
+        self.out("")
+        self.out(self.c("  IOC dari .htaccess penyerang (daftar allowlist = kandidat backdoor):", "BOLD"))
+        if scanner.ioc_random:
+            self.out("    %s : %s" % (self.c("acak (hampir pasti shell)", "HIGH"),
+                                      ", ".join(sorted(scanner.ioc_random))))
+        if scanner.ioc_generic:
+            self.out("    %s : %s" % (self.c("umum (verifikasi manual)", "MEDIUM"),
+                                      ", ".join(sorted(scanner.ioc_generic))))
+        self.out(self.c("    -> nama-nama .php ini otomatis diburu di seluruh direktori.", "DIM"))
+
+    def restore_report(self, actions):
+        if not actions:
+            return
+        self.out("")
+        self.out(self.c("  PEMULIHAN .htaccess (%d):" % len(actions), "BOLD"))
+        for a in actions:
+            self.out("    [%s] %s (template: %s)%s"
+                     % (a["status"], a["path"], a["template"],
+                        "  " + a["note"] if a["note"] else ""))
+            if a.get("backup"):
+                self.out(self.c("        cadangan: %s" % a["backup"], "DIM"))
+            if self.verbose and a.get("would_write"):
+                for ln in a["would_write"].splitlines():
+                    self.out(self.c("        | " + ln, "DIM"))
+
     def summary(self, stats, findings, log_path, json_path, elapsed):
         cnt = collections.Counter(f["level"] for f in findings)
         self.out("")
@@ -884,10 +1155,14 @@ class Reporter(object):
         self.out(self.c("-" * 78, "DIM"))
 
     @staticmethod
-    def write_logs(log_path, json_path, meta, stats, findings, actions, errors):
+    def write_logs(log_path, json_path, meta, stats, findings, actions, errors,
+                   restore_actions=None, iocs=None):
+        restore_actions = restore_actions or []
+        iocs = iocs or {}
         clean = [{k: v for k, v in f.items() if not k.startswith("_")} for f in findings]
         payload = {"meta": meta, "stats": dict(stats), "findings": clean,
-                   "actions": actions, "errors": errors}
+                   "actions": actions, "restore_htaccess": restore_actions,
+                   "htaccess_iocs": iocs, "errors": errors}
         write_private(json_path, json.dumps(payload, indent=2, ensure_ascii=False))
 
         L = []
@@ -931,6 +1206,27 @@ class Reporter(object):
                                            a["quarantined_as"] or "-", a["note"]))
             if a.get("restore_cmd") and a["status"] == "QUARANTINED":
                 L.append("    restore: " + a["restore_cmd"])
+        if iocs.get("random") or iocs.get("generic"):
+            L.append("")
+            L.append("-" * 78)
+            L.append("IOC .htaccess (nama allowlist penyerang = kandidat backdoor)")
+            L.append("-" * 78)
+            if iocs.get("random"):
+                L.append("  acak  : " + ", ".join(iocs["random"]))
+            if iocs.get("generic"):
+                L.append("  umum  : " + ", ".join(iocs["generic"]))
+            for name, src in sorted((iocs.get("sources") or {}).items()):
+                L.append("    %-20s <- %s" % (name, src))
+        if restore_actions:
+            L.append("")
+            L.append("-" * 78)
+            L.append("PEMULIHAN .htaccess (%d)" % len(restore_actions))
+            L.append("-" * 78)
+            for a in restore_actions:
+                L.append("[%s] %s (template=%s) %s"
+                         % (a["status"], a["path"], a["template"], a["note"]))
+                if a.get("backup"):
+                    L.append("    cadangan: " + a["backup"])
         if errors:
             L.append("")
             L.append("-" * 78)
@@ -994,6 +1290,13 @@ def build_parser():
                    help="level minimum yang dikarantina (default: HIGH)")
     p.add_argument("--quarantine-config", action="store_true",
                    help="ikut karantina .htaccess/.user.ini (default: hanya dilaporkan)")
+    p.add_argument("--restore-htaccess", action="store_true",
+                   help="pulihkan .htaccess terkontaminasi ke default bersih "
+                        "(cadangkan asli ke karantina dulu). Preview di --dry-run, "
+                        "eksekusi di --quarantine.")
+    p.add_argument("--htaccess-template", choices=["auto", "wp-root", "harden", "minimal"],
+                   default="auto",
+                   help="template pemulihan .htaccess (default: auto-deteksi per lokasi)")
     p.add_argument("--persistence", action="store_true",
                    help="cek juga crontab, proses milik user, dan rc files (report only)")
     p.add_argument("--max-size", type=int, default=8, metavar="MB", help="batas baca per berkas (default 8)")
@@ -1071,7 +1374,8 @@ def main():
     if args.mode in ("dry-run", "quarantine"):
         q_rank = LEVEL_RANK[args.quarantine_level]
         candidates = [f for f in findings if LEVEL_RANK[f["level"]] >= q_rank
-                      and (f["quarantinable"] or (args.quarantine_config and f["is_config"]))]
+                      and (f["quarantinable"] or (args.quarantine_config and f["is_config"]))
+                      and not (args.restore_htaccess and f.get("is_htaccess"))]
         for f in findings:
             if f not in candidates and not f.get("action"):
                 f["action"] = "REVIEW MANUAL" if (f["is_config"] or not f["quarantinable"]) else ""
@@ -1094,12 +1398,43 @@ def main():
             for f in candidates:
                 f["action"] = "DIBATALKAN oleh user"
 
+    # --- Pemulihan .htaccess terkontaminasi ke default ---
+    restore_actions = []
+    if args.restore_htaccess:
+        targets = [f for f in findings if f.get("is_htaccess")
+                   and LEVEL_RANK[f["level"]] >= LEVEL_RANK["MEDIUM"]]
+        restore_dry = (args.mode != "quarantine")
+        proceed = True
+        if not restore_dry and targets and not args.yes:
+            if not sys.stdin.isatty():
+                sys.stderr.write("[!] Mode non-interaktif: gunakan -y untuk memulihkan .htaccess.\n")
+                proceed = False
+            else:
+                rep.out(rep.c("Akan MEMULIHKAN %d berkas .htaccess (asli dicadangkan ke karantina):"
+                              % len(targets), "BOLD"))
+                for f in targets:
+                    rep.out("  - [%s] %s" % (f["level"], f["path"]))
+                proceed = input("Lanjutkan pemulihan? [y/N]: ").strip().lower() in ("y", "ya", "yes")
+        if targets and proceed:
+            hr = HtaccessRestorer(root, args.htaccess_template, dry_run=restore_dry)
+            restore_actions = hr.execute(targets)
+            meta["quarantine_dir"] = hr.qdir
+        elif targets:
+            for f in targets:
+                f["action"] = "RESTORE dibatalkan"
+
     rep.findings(findings, LEVEL_RANK[args.min_level])
+    rep.iocs(scanner)
+    rep.restore_report(restore_actions)
     elapsed = time.time() - start
     meta["finished"] = iso(time.time())
     meta["elapsed_sec"] = round(elapsed, 2)
+    iocs = {"random": sorted(scanner.ioc_random), "generic": sorted(scanner.ioc_generic),
+            "sources": {k: v[0] for k, v in scanner.ioc_sources.items()},
+            "contaminated_dirs": sorted(scanner.ioc_dirs)}
     try:
-        Reporter.write_logs(log_path, json_path, meta, scanner.stats, findings, actions, scanner.errors)
+        Reporter.write_logs(log_path, json_path, meta, scanner.stats, findings, actions,
+                            scanner.errors, restore_actions=restore_actions, iocs=iocs)
     except (OSError, IOError) as exc:
         sys.stderr.write("[!] Gagal menulis log: %s\n" % exc)
     rep.summary(scanner.stats, findings, log_path, json_path, elapsed)
@@ -1107,6 +1442,14 @@ def main():
     if args.mode == "quarantine" and actions:
         done = sum(1 for a in actions if a["status"] == "QUARANTINED")
         rep.out(rep.c("  Karantina: %d/%d berhasil -> %s (chmod 000)" % (done, len(actions), meta["quarantine_dir"]), "BOLD"))
+    if restore_actions:
+        rdone = sum(1 for a in restore_actions if a["status"] == "RESTORED")
+        if restore_actions[0]["status"] == "DRY-RUN":
+            rep.out(rep.c("  Pemulihan .htaccess: %d berkas akan dipulihkan (dry-run, tanpa perubahan)"
+                          % len(restore_actions), "BOLD"))
+        else:
+            rep.out(rep.c("  Pemulihan .htaccess: %d/%d berhasil dipulihkan ke default"
+                          % (rdone, len(restore_actions)), "BOLD"))
 
     levels = {f["level"] for f in findings}
     if "HIGH" in levels:
